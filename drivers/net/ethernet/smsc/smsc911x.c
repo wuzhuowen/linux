@@ -114,9 +114,7 @@ struct smsc911x_data {
 	/* spinlock to ensure register accesses are serialised */
 	spinlock_t dev_lock;
 
-	struct phy_device *phy_dev;
 	struct mii_bus *mii_bus;
-	int phy_irq[PHY_MAX_ADDR];
 	unsigned int using_extphy;
 	int last_duplex;
 	int last_carrier;
@@ -834,7 +832,7 @@ static int smsc911x_phy_reset(struct smsc911x_data *pdata)
 static int smsc911x_phy_loopbacktest(struct net_device *dev)
 {
 	struct smsc911x_data *pdata = netdev_priv(dev);
-	struct phy_device *phy_dev = pdata->phy_dev;
+	struct phy_device *phy_dev = dev->phydev;
 	int result = -EIO;
 	unsigned int i, val;
 	unsigned long flags;
@@ -864,8 +862,8 @@ static int smsc911x_phy_loopbacktest(struct net_device *dev)
 
 	for (i = 0; i < 10; i++) {
 		/* Set PHY to 10/FD, no ANEG, and loopback mode */
-		smsc911x_mii_write(phy_dev->bus, phy_dev->addr,	MII_BMCR,
-			BMCR_LOOPBACK | BMCR_FULLDPLX);
+		smsc911x_mii_write(phy_dev->mdio.bus, phy_dev->mdio.addr,
+				   MII_BMCR, BMCR_LOOPBACK | BMCR_FULLDPLX);
 
 		/* Enable MAC tx/rx, FD */
 		spin_lock_irqsave(&pdata->mac_lock, flags);
@@ -893,7 +891,7 @@ static int smsc911x_phy_loopbacktest(struct net_device *dev)
 	spin_unlock_irqrestore(&pdata->mac_lock, flags);
 
 	/* Cancel PHY loopback mode */
-	smsc911x_mii_write(phy_dev->bus, phy_dev->addr, MII_BMCR, 0);
+	smsc911x_mii_write(phy_dev->mdio.bus, phy_dev->mdio.addr, MII_BMCR, 0);
 
 	smsc911x_reg_write(pdata, TX_CFG, 0);
 	smsc911x_reg_write(pdata, RX_CFG, 0);
@@ -904,7 +902,8 @@ static int smsc911x_phy_loopbacktest(struct net_device *dev)
 
 static void smsc911x_phy_update_flowcontrol(struct smsc911x_data *pdata)
 {
-	struct phy_device *phy_dev = pdata->phy_dev;
+	struct net_device *ndev = pdata->dev;
+	struct phy_device *phy_dev = ndev->phydev;
 	u32 afc = smsc911x_reg_read(pdata, AFC_CFG);
 	u32 flow;
 	unsigned long flags;
@@ -945,7 +944,7 @@ static void smsc911x_phy_update_flowcontrol(struct smsc911x_data *pdata)
 static void smsc911x_phy_adjust_link(struct net_device *dev)
 {
 	struct smsc911x_data *pdata = netdev_priv(dev);
-	struct phy_device *phy_dev = pdata->phy_dev;
+	struct phy_device *phy_dev = dev->phydev;
 	unsigned long flags;
 	int carrier;
 
@@ -1021,7 +1020,7 @@ static int smsc911x_mii_probe(struct net_device *dev)
 	}
 
 	SMSC_TRACE(pdata, probe, "PHY: addr %d, phy_id 0x%08X",
-		   phydev->addr, phydev->phy_id);
+		   phydev->mdio.addr, phydev->phy_id);
 
 	ret = phy_connect_direct(dev, phydev, &smsc911x_phy_adjust_link,
 				 pdata->config.phy_interface);
@@ -1031,16 +1030,13 @@ static int smsc911x_mii_probe(struct net_device *dev)
 		return ret;
 	}
 
-	netdev_info(dev,
-		    "attached PHY driver [%s] (mii_bus:phy_addr=%s, irq=%d)\n",
-		    phydev->drv->name, dev_name(&phydev->dev), phydev->irq);
+	phy_attached_info(phydev);
 
 	/* mask with MAC supported features */
 	phydev->supported &= (PHY_BASIC_FEATURES | SUPPORTED_Pause |
 			      SUPPORTED_Asym_Pause);
 	phydev->advertising = phydev->supported;
 
-	pdata->phy_dev = phydev;
 	pdata->last_duplex = -1;
 	pdata->last_carrier = -1;
 
@@ -1061,7 +1057,7 @@ static int smsc911x_mii_init(struct platform_device *pdev,
 			     struct net_device *dev)
 {
 	struct smsc911x_data *pdata = netdev_priv(dev);
-	int err = -ENXIO, i;
+	int err = -ENXIO;
 
 	pdata->mii_bus = mdiobus_alloc();
 	if (!pdata->mii_bus) {
@@ -1075,9 +1071,6 @@ static int smsc911x_mii_init(struct platform_device *pdev,
 	pdata->mii_bus->priv = pdata;
 	pdata->mii_bus->read = smsc911x_mii_read;
 	pdata->mii_bus->write = smsc911x_mii_write;
-	pdata->mii_bus->irq = pdata->phy_irq;
-	for (i = 0; i < PHY_MAX_ADDR; ++i)
-		pdata->mii_bus->irq[i] = PHY_POLL;
 
 	pdata->mii_bus->parent = &pdev->dev;
 
@@ -1344,9 +1337,11 @@ static void smsc911x_rx_multicast_update_workaround(struct smsc911x_data *pdata)
 
 static int smsc911x_phy_general_power_up(struct smsc911x_data *pdata)
 {
+	struct net_device *ndev = pdata->dev;
+	struct phy_device *phy_dev = ndev->phydev;
 	int rc = 0;
 
-	if (!pdata->phy_dev)
+	if (!phy_dev)
 		return rc;
 
 	/* If the internal PHY is in General Power-Down mode, all, except the
@@ -1356,7 +1351,7 @@ static int smsc911x_phy_general_power_up(struct smsc911x_data *pdata)
 	 * In that case, clear the bit 0.11, so the PHY powers up and we can
 	 * access to the phy registers.
 	 */
-	rc = phy_read(pdata->phy_dev, MII_BMCR);
+	rc = phy_read(phy_dev, MII_BMCR);
 	if (rc < 0) {
 		SMSC_WARN(pdata, drv, "Failed reading PHY control reg");
 		return rc;
@@ -1366,7 +1361,7 @@ static int smsc911x_phy_general_power_up(struct smsc911x_data *pdata)
 	 * disable the general power down-mode.
 	 */
 	if (rc & BMCR_PDOWN) {
-		rc = phy_write(pdata->phy_dev, MII_BMCR, rc & ~BMCR_PDOWN);
+		rc = phy_write(phy_dev, MII_BMCR, rc & ~BMCR_PDOWN);
 		if (rc < 0) {
 			SMSC_WARN(pdata, drv, "Failed writing PHY control reg");
 			return rc;
@@ -1380,12 +1375,14 @@ static int smsc911x_phy_general_power_up(struct smsc911x_data *pdata)
 
 static int smsc911x_phy_disable_energy_detect(struct smsc911x_data *pdata)
 {
+	struct net_device *ndev = pdata->dev;
+	struct phy_device *phy_dev = ndev->phydev;
 	int rc = 0;
 
-	if (!pdata->phy_dev)
+	if (!phy_dev)
 		return rc;
 
-	rc = phy_read(pdata->phy_dev, MII_LAN83C185_CTRL_STATUS);
+	rc = phy_read(phy_dev, MII_LAN83C185_CTRL_STATUS);
 
 	if (rc < 0) {
 		SMSC_WARN(pdata, drv, "Failed reading PHY control reg");
@@ -1395,7 +1392,7 @@ static int smsc911x_phy_disable_energy_detect(struct smsc911x_data *pdata)
 	/* Only disable if energy detect mode is already enabled */
 	if (rc & MII_LAN83C185_EDPWRDOWN) {
 		/* Disable energy detect mode for this SMSC Transceivers */
-		rc = phy_write(pdata->phy_dev, MII_LAN83C185_CTRL_STATUS,
+		rc = phy_write(phy_dev, MII_LAN83C185_CTRL_STATUS,
 			       rc & (~MII_LAN83C185_EDPWRDOWN));
 
 		if (rc < 0) {
@@ -1411,12 +1408,14 @@ static int smsc911x_phy_disable_energy_detect(struct smsc911x_data *pdata)
 
 static int smsc911x_phy_enable_energy_detect(struct smsc911x_data *pdata)
 {
+	struct net_device *ndev = pdata->dev;
+	struct phy_device *phy_dev = ndev->phydev;
 	int rc = 0;
 
-	if (!pdata->phy_dev)
+	if (!phy_dev)
 		return rc;
 
-	rc = phy_read(pdata->phy_dev, MII_LAN83C185_CTRL_STATUS);
+	rc = phy_read(phy_dev, MII_LAN83C185_CTRL_STATUS);
 
 	if (rc < 0) {
 		SMSC_WARN(pdata, drv, "Failed reading PHY control reg");
@@ -1426,7 +1425,7 @@ static int smsc911x_phy_enable_energy_detect(struct smsc911x_data *pdata)
 	/* Only enable if energy detect mode is already disabled */
 	if (!(rc & MII_LAN83C185_EDPWRDOWN)) {
 		/* Enable energy detect mode for this SMSC Transceivers */
-		rc = phy_write(pdata->phy_dev, MII_LAN83C185_CTRL_STATUS,
+		rc = phy_write(phy_dev, MII_LAN83C185_CTRL_STATUS,
 			       rc | MII_LAN83C185_EDPWRDOWN);
 
 		if (rc < 0) {
@@ -1523,7 +1522,7 @@ static int smsc911x_open(struct net_device *dev)
 	unsigned int intcfg;
 
 	/* if the phy is not yet registered, retry later*/
-	if (!pdata->phy_dev) {
+	if (!dev->phydev) {
 		SMSC_WARN(pdata, hw, "phy_dev is NULL");
 		return -EAGAIN;
 	}
@@ -1614,7 +1613,7 @@ static int smsc911x_open(struct net_device *dev)
 	pdata->last_carrier = -1;
 
 	/* Bring the PHY up */
-	phy_start(pdata->phy_dev);
+	phy_start(dev->phydev);
 
 	temp = smsc911x_reg_read(pdata, HW_CFG);
 	/* Preserve TX FIFO size and external PHY configuration */
@@ -1669,8 +1668,8 @@ static int smsc911x_stop(struct net_device *dev)
 	smsc911x_tx_update_txcounters(dev);
 
 	/* Bring the PHY down */
-	if (pdata->phy_dev)
-		phy_stop(pdata->phy_dev);
+	if (dev->phydev)
+		phy_stop(dev->phydev);
 
 	SMSC_TRACE(pdata, ifdown, "Interface stopped");
 	return 0;
@@ -1910,30 +1909,10 @@ static int smsc911x_set_mac_address(struct net_device *dev, void *p)
 /* Standard ioctls for mii-tool */
 static int smsc911x_do_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 {
-	struct smsc911x_data *pdata = netdev_priv(dev);
-
-	if (!netif_running(dev) || !pdata->phy_dev)
+	if (!netif_running(dev) || !dev->phydev)
 		return -EINVAL;
 
-	return phy_mii_ioctl(pdata->phy_dev, ifr, cmd);
-}
-
-static int
-smsc911x_ethtool_getsettings(struct net_device *dev, struct ethtool_cmd *cmd)
-{
-	struct smsc911x_data *pdata = netdev_priv(dev);
-
-	cmd->maxtxpkt = 1;
-	cmd->maxrxpkt = 1;
-	return phy_ethtool_gset(pdata->phy_dev, cmd);
-}
-
-static int
-smsc911x_ethtool_setsettings(struct net_device *dev, struct ethtool_cmd *cmd)
-{
-	struct smsc911x_data *pdata = netdev_priv(dev);
-
-	return phy_ethtool_sset(pdata->phy_dev, cmd);
+	return phy_mii_ioctl(dev->phydev, ifr, cmd);
 }
 
 static void smsc911x_ethtool_getdrvinfo(struct net_device *dev,
@@ -1947,9 +1926,7 @@ static void smsc911x_ethtool_getdrvinfo(struct net_device *dev,
 
 static int smsc911x_ethtool_nwayreset(struct net_device *dev)
 {
-	struct smsc911x_data *pdata = netdev_priv(dev);
-
-	return phy_start_aneg(pdata->phy_dev);
+	return phy_start_aneg(dev->phydev);
 }
 
 static u32 smsc911x_ethtool_getmsglevel(struct net_device *dev)
@@ -1975,7 +1952,7 @@ smsc911x_ethtool_getregs(struct net_device *dev, struct ethtool_regs *regs,
 			 void *buf)
 {
 	struct smsc911x_data *pdata = netdev_priv(dev);
-	struct phy_device *phy_dev = pdata->phy_dev;
+	struct phy_device *phy_dev = dev->phydev;
 	unsigned long flags;
 	unsigned int i;
 	unsigned int j = 0;
@@ -1992,7 +1969,8 @@ smsc911x_ethtool_getregs(struct net_device *dev, struct ethtool_regs *regs,
 	}
 
 	for (i = 0; i <= 31; i++)
-		data[j++] = smsc911x_mii_read(phy_dev->bus, phy_dev->addr, i);
+		data[j++] = smsc911x_mii_read(phy_dev->mdio.bus,
+					      phy_dev->mdio.addr, i);
 }
 
 static void smsc911x_eeprom_enable_access(struct smsc911x_data *pdata)
@@ -2120,8 +2098,6 @@ static int smsc911x_ethtool_set_eeprom(struct net_device *dev,
 }
 
 static const struct ethtool_ops smsc911x_ethtool_ops = {
-	.get_settings = smsc911x_ethtool_getsettings,
-	.set_settings = smsc911x_ethtool_setsettings,
 	.get_link = ethtool_op_get_link,
 	.get_drvinfo = smsc911x_ethtool_getdrvinfo,
 	.nway_reset = smsc911x_ethtool_nwayreset,
@@ -2133,6 +2109,8 @@ static const struct ethtool_ops smsc911x_ethtool_ops = {
 	.get_eeprom = smsc911x_ethtool_get_eeprom,
 	.set_eeprom = smsc911x_ethtool_set_eeprom,
 	.get_ts_info = ethtool_op_get_ts_info,
+	.get_link_ksettings = phy_ethtool_get_link_ksettings,
+	.set_link_ksettings = phy_ethtool_set_link_ksettings,
 };
 
 static const struct net_device_ops smsc911x_netdev_ops = {
@@ -2313,12 +2291,11 @@ static int smsc911x_drv_remove(struct platform_device *pdev)
 	pdata = netdev_priv(dev);
 	BUG_ON(!pdata);
 	BUG_ON(!pdata->ioaddr);
-	BUG_ON(!pdata->phy_dev);
+	BUG_ON(!dev->phydev);
 
 	SMSC_TRACE(pdata, ifdown, "Stopping driver");
 
-	phy_disconnect(pdata->phy_dev);
-	pdata->phy_dev = NULL;
+	phy_disconnect(dev->phydev);
 	mdiobus_unregister(pdata->mii_bus);
 	mdiobus_free(pdata->mii_bus);
 

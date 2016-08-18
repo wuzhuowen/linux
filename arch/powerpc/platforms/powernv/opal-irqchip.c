@@ -83,7 +83,19 @@ static void opal_event_unmask(struct irq_data *d)
 	set_bit(d->hwirq, &opal_event_irqchip.mask);
 
 	opal_poll_events(&events);
-	opal_handle_events(be64_to_cpu(events));
+	last_outstanding_events = be64_to_cpu(events);
+
+	/*
+	 * We can't just handle the events now with opal_handle_events().
+	 * If we did we would deadlock when opal_event_unmask() is called from
+	 * handle_level_irq() with the irq descriptor lock held, because
+	 * calling opal_handle_events() would call generic_handle_irq() and
+	 * then handle_level_irq() which would try to take the descriptor lock
+	 * again. Instead queue the events for later.
+	 */
+	if (last_outstanding_events & opal_event_irqchip.mask)
+		/* Need to retrigger the interrupt */
+		irq_work_queue(&opal_event_irq_work);
 }
 
 static int opal_event_set_type(struct irq_data *d, unsigned int flow_type)
@@ -216,7 +228,8 @@ int __init opal_event_init(void)
 		}
 
 		/* Install interrupt handler */
-		rc = request_irq(virq, opal_interrupt, 0, "opal", NULL);
+		rc = request_irq(virq, opal_interrupt, IRQF_TRIGGER_LOW,
+				 "opal", NULL);
 		if (rc) {
 			irq_dispose_mapping(virq);
 			pr_warn("Error %d requesting irq %d (0x%x)\n",

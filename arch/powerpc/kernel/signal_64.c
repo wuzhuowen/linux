@@ -104,6 +104,7 @@ static long setup_sigcontext(struct sigcontext __user *sc, struct pt_regs *regs,
 	 */
 #ifdef CONFIG_ALTIVEC
 	elf_vrreg_t __user *v_regs = sigcontext_vmx_regs(sc);
+	unsigned long vrsave;
 #endif
 	unsigned long msr = regs->msr;
 	long err = 0;
@@ -125,9 +126,13 @@ static long setup_sigcontext(struct sigcontext __user *sc, struct pt_regs *regs,
 	/* We always copy to/from vrsave, it's 0 if we don't have or don't
 	 * use altivec.
 	 */
-	if (cpu_has_feature(CPU_FTR_ALTIVEC))
-		current->thread.vrsave = mfspr(SPRN_VRSAVE);
-	err |= __put_user(current->thread.vrsave, (u32 __user *)&v_regs[33]);
+	vrsave = 0;
+	if (cpu_has_feature(CPU_FTR_ALTIVEC)) {
+		vrsave = mfspr(SPRN_VRSAVE);
+		current->thread.vrsave = vrsave;
+	}
+
+	err |= __put_user(vrsave, (u32 __user *)&v_regs[33]);
 #else /* CONFIG_ALTIVEC */
 	err |= __put_user(0, &sc->v_regs);
 #endif /* CONFIG_ALTIVEC */
@@ -147,7 +152,7 @@ static long setup_sigcontext(struct sigcontext __user *sc, struct pt_regs *regs,
 	 * VMX data.
 	 */
 	if (current->thread.used_vsr && ctx_has_vsx_region) {
-		__giveup_vsx(current);
+		flush_vsx_to_thread(current);
 		v_regs += ELF_NVRREG;
 		err |= copy_vsx_to_user(v_regs, current);
 		/* set MSR_VSX in the MSR value in the frame to
@@ -270,7 +275,7 @@ static long setup_tm_sigcontexts(struct sigcontext __user *sc,
 	 * VMX data.
 	 */
 	if (current->thread.used_vsr) {
-		__giveup_vsx(current);
+		flush_vsx_to_thread(current);
 		v_regs += ELF_NVRREG;
 		tm_v_regs += ELF_NVRREG;
 
@@ -348,15 +353,6 @@ static long restore_sigcontext(struct pt_regs *regs, sigset_t *set, int sig,
 		regs->gpr[13] = save_r13;
 	if (set != NULL)
 		err |=  __get_user(set->sig[0], &sc->oldmask);
-
-	/*
-	 * Do this before updating the thread state in
-	 * current->thread.fpr/vr.  That way, if we get preempted
-	 * and another task grabs the FPU/Altivec, it won't be
-	 * tempted to save the current CPU state into the thread_struct
-	 * and corrupt what we are writing there.
-	 */
-	discard_lazy_cpu_state();
 
 	/*
 	 * Force reload of FP/VEC.
@@ -467,15 +463,6 @@ static long restore_tm_sigcontexts(struct pt_regs *regs,
 	err |= __get_user(regs->dar, &sc->gp_regs[PT_DAR]);
 	err |= __get_user(regs->dsisr, &sc->gp_regs[PT_DSISR]);
 	err |= __get_user(regs->result, &sc->gp_regs[PT_RESULT]);
-
-	/*
-	 * Do this before updating the thread state in
-	 * current->thread.fpr/vr.  That way, if we get preempted
-	 * and another task grabs the FPU/Altivec, it won't be
-	 * tempted to save the current CPU state into the thread_struct
-	 * and corrupt what we are writing there.
-	 */
-	discard_lazy_cpu_state();
 
 	/*
 	 * Force reload of FP/VEC.
